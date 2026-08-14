@@ -199,11 +199,11 @@ class ParallelDialogAgent(Agent):
 
 
 @pytest.mark.asyncio
-async def test_parallel_agent_tasks_refuse_the_second() -> None:
-    """Two AgentTasks awaited from one turn's parallel tool calls contend for the same
-    activity. Only one may pause it: the other's handoff would be overwritten, leaving it
-    waiting on a result nothing can produce, so its function call never returns and the
-    speech never finishes. The second is refused with a ToolError instead."""
+async def test_parallel_agent_tasks_run_in_turn() -> None:
+    """Two AgentTasks awaited from one turn's parallel tool calls both pause the same
+    activity, so they queue and run one after the other. Running them concurrently would
+    leave every handoff but the last overwritten, and those tasks waiting on a result
+    nothing can produce - function calls that never return and a speech that never ends."""
     llm = FakeLLM(
         fake_responses=[
             # one turn, two tool calls - each tool awaits a DialogTask
@@ -218,7 +218,7 @@ async def test_parallel_agent_tasks_refuse_the_second() -> None:
                 ],
             ),
             FakeLLMResponse(input="dialog_greeting", content="what is it?", ttft=0, duration=0),
-            # user answers the dialog that did run -> it completes and hands back
+            # each dialog completes on its own user turn
             FakeLLMResponse(
                 input="done",
                 content="",
@@ -234,18 +234,24 @@ async def test_parallel_agent_tasks_refuse_the_second() -> None:
         await sess.start(agent)
 
         await asyncio.wait_for(sess.run(user_input="go"), timeout=5.0)
-        assert isinstance(sess.current_agent, DialogTask)
+        first = sess.current_agent
+        assert isinstance(first, DialogTask)
+
+        # the first dialog hands back, and the one queued behind it takes the activity
+        await asyncio.wait_for(sess.run(user_input="done"), timeout=5.0)
+        second = sess.current_agent
+        assert isinstance(second, DialogTask) and second is not first
 
         await asyncio.wait_for(sess.run(user_input="done"), timeout=5.0)
         assert isinstance(sess.current_agent, ParallelDialogAgent)
     finally:
-        # a refused task that instead hung would leave its function call unfinished, and
-        # the close waiting on it - bounded so that regression reports these assertions
-        # rather than stalling the loop with nothing left to schedule
+        # a queued task that hung instead of running would leave its function call
+        # unfinished and the close waiting on it - bounded so that regression reports
+        # these assertions rather than stalling the loop with nothing left to schedule
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(sess.aclose(), timeout=30.0)
 
-    assert sorted(o.split(":")[1] for o in agent.outcomes) == ["ran", "refused"]
+    assert sorted(agent.outcomes) == ["email:ran", "name:ran"]
 
     # both calls carry an output: neither func_exec was left awaiting a result forever
     outputs = {
@@ -254,8 +260,7 @@ async def test_parallel_agent_tasks_refuse_the_second() -> None:
         if item.type == "function_call_output" and item.call_id in ("call_1", "call_2")
     }
     assert set(outputs) == {"call_1", "call_2"}
-    # the refusal reaches the model rather than being silently dropped
-    assert sum(1 for out in outputs.values() if "refused" in out) == 1
+    assert not any("refused" in out for out in outputs.values())
 
 
 def _build_fake_llm() -> FakeLLM:

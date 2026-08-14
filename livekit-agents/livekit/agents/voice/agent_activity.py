@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import heapq
 import json
 import time
-from collections.abc import AsyncIterable, Coroutine
+from collections.abc import AsyncGenerator, AsyncIterable, Coroutine
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -20,6 +21,7 @@ from ..llm.chat_context import Instructions
 from ..llm.realtime_fallback_adapter import _FallbackRealtimeSession
 from ..llm.tool_context import (
     StopResponse,
+    ToolError,
     ToolFlag,
     get_fnc_tool_names,
 )
@@ -39,7 +41,6 @@ from ..utils.misc import is_given
 from ._utils import _set_participant_attributes
 from .agent import (
     Agent,
-    AgentTask,
     ModelSettings,
     _get_activity_task_info,
     _set_activity_task_info,
@@ -226,9 +227,8 @@ class AgentActivity(RecognitionHooks):
         self._authorization_allowed.set()
 
         self._drain_blocked_tasks: set[asyncio.Task[Any]] = set()
-        # The inline AgentTask that paused this activity, held from before the pause until
-        # after the resume. At most one at a time.
-        self._inline_task: AgentTask[Any] | None = None
+        # Serializes the inline AgentTasks that pause this activity - see _inline_task_slot.
+        self._inline_task_lock = asyncio.Lock()
         self._mcp_tools: list[mcp.MCPToolset] = []
 
         # activity-scoped executor: cancels cancellable tools / awaits the rest on drain,
@@ -1196,6 +1196,55 @@ class AgentActivity(RecognitionHooks):
             # This means that even if the SpeechHandle themselves have finished,
             # we still wait for the entire execution (e.g function_tools)
             await asyncio.shield(self._scheduling_atask)
+
+    @contextlib.asynccontextmanager
+    async def _inline_task_slot(
+        self,
+        *,
+        speech_handle: SpeechHandle | None,
+        blocked_tasks: list[asyncio.Task[Any]],
+    ) -> AsyncGenerator[None, None]:
+        """Grants the activity to one awaited inline AgentTask at a time.
+
+        Pausing an activity is a single slot: concurrent handoffs would leave every switch
+        but the last overwritten, and those tasks awaiting a result nothing can produce. The
+        inline tasks of a turn's parallel tool calls queue here and take the slot in turn.
+        A nested task pauses a different activity, so it never queues behind the task it is
+        nested in.
+
+        Each step below is ordered against the queue, and inverting any of them hangs the
+        session in its own way, so they belong together rather than at the call site.
+        """
+        # before the queue: the tasks behind it share this speech, and a hold released
+        # between them lets one task's user turns interrupt it out from under the rest
+        if speech_handle is not None:
+            if speech_handle.interrupted:
+                raise RuntimeError("the speech that awaited the inline task is interrupted")
+
+            speech_handle._hold_interruptions()
+
+        try:
+            # before the queue: a queued task absent from the drain set makes session close
+            # wait on the slot it is still queued for
+            self._add_drain_blocked_tasks(blocked_tasks)
+
+            async with self._inline_task_lock:
+                if self._closed:
+                    raise ToolError(
+                        "the activity that awaited the inline task closed while an earlier "
+                        "one was running"
+                    )
+
+                # past the queue: a run watching a task still waiting its turn waits for the
+                # user input the task ahead of it needs
+                if (run_state := self._session._global_run_state) and not run_state.done():
+                    for task in blocked_tasks:
+                        run_state._watch_handle(task)
+
+                yield
+        finally:
+            if speech_handle is not None:
+                speech_handle._release_interruptions()
 
     def _add_drain_blocked_tasks(self, tasks: list[asyncio.Task[Any]]) -> None:
         # tasks blocked on an agent handoff are excluded from the drain wait,
